@@ -58,9 +58,83 @@ docker run -dit --name kafka -p 9092:9092 --link zookeeper:zookeeper debezium/ka
 docker start mysql nifi zookeeper kafka connect spark-master spark-worker
 
 
-## Connect
 
-docker run -dit --name connect -p 8083:8083 -e GROUP_ID=1 -e CONFIG_STORAGE_TOPIC=my-connect-configs -e OFFSET_STORAGE_TOPIC=my-connect-offsets -e STATUS_STORAGE_TOPIC=my_connect_statuses --link zookeeper:zookeeper --link kafka:kafka --link mysql:mysql debezium/connect:1.6
+# MSK
+
+Client Information -> Plaintext Private Endpoint
+Install telnet in virtual machine
+
+```bash
+sudo yum install telnet -y 
+telnet b-1.finalproject.m5cy8k.c3.kafka.ca-central-1.amazonaws.com:9092
+
+```
+
+```bash
+# Be sure to only stop the docker containers if you want to start them again in the future
+# docker stop kafka zookeeper connect spark-master spark-worker
+# WARNING: running docker rm will remove the data and you will have to redo several steps
+
+# Set up client.properties as per the guide in kafka_2.12-2.6.2/bin
+
+# Set up environment variables for your connection strings
+ZOOKEEPER_CONNECTION_STRING=z-3.finalproject.m5cy8k.c3.kafka.ca-central-1.amazonaws.com:2181,z-2.finalproject.m5cy8k.c3.kafka.ca-central-1.amazonaws.com:2181,z-1.finalproject.m5cy8k.c3.kafka.ca-central-1.amazonaws.com:2181
+BOOTSTRAP_SERVERS=b-1.finalproject.m5cy8k.c3.kafka.ca-central-1.amazonaws.com:9092,b-3.finalproject.m5cy8k.c3.kafka.ca-central-1.amazonaws.com:9092,b-2.finalproject.m5cy8k.c3.kafka.ca-central-1.amazonaws.com:9092
+
+# Check that you are able to retrieve the topics on MSK
+./kafka-topics.sh --list --zookeeper $ZOOKEEPER_CONNECTION_STRING
+
+# Start the connect-msk docker so that the nifi and mysql containers are connected and ready to talk to MSK
+docker run -dit --name connect-msk -p 8083:8083 -e GROUP_ID=1 -e CONFIG_STORAGE_TOPIC=my-connect-configs -e OFFSET_STORAGE_TOPIC=my-connect-offsets -e STATUS_STORAGE_TOPIC=my_connect_statuses -e BOOTSTRAP_SERVERS=$BOOTSTRAP_SERVERS -e KAFKA_VERSION=2.6.2 -e CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR=2 -e CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR=2 -e CONNECT_STATUS_STORAGE_REPLICATION_FACTOR=2 --link mysql:mysql debezium/connect:1.8.0.Final
+
+# Read the messages in the connection topic: my-connect-configs
+./kafka-console-consumer.sh  --bootstrap-server $BOOTSTRAP_SERVERS --topic my-connect-configs --from-beginning
+
+# Create a connector so that nifi mysql are sending messages to kafka in MSK
+curl -i -X POST -H "Accept:application/json" -H "Content-Type:application/json" localhost:8083/connectors/ -d '{ "name": "bus-connector", "config": { "connector.class": "io.debezium.connector.mysql.MySqlConnector", "tasks.max": "1", "database.hostname": "mysql", "database.port": "3306", "database.user": "root", "database.password": "debezium", "database.server.id": "184054", "database.server.name": "dbserver1", "database.include.list": "demo", "database.history.kafka.bootstrap.servers": "'"$BOOTSTRAP_SERVERS"'", "database.history.kafka.topic": "dbhistory.demo" } }'
+
+ ./kafka-topics.sh --list --zookeeper $ZOOKEEPER_CONNECTION_STRING
+
+# read incoming messages on dbserver1.demo.bus_status
+./kafka-console-consumer.sh  --bootstrap-server $BOOTSTRAP_SERVERS  --topic dbserver1.demo.bus_status  --from-beginning
+
+```
+
+Let's set up the EMR Cluster: https://ca-central-1.console.aws.amazon.com/elasticmapreduce/home?region=ca-central-1#
+Use screenshots - For the initial setup.
+Once we are setup, navigate the EMR IAM Role. eg: EMR_EC2_DefaultRole and make sure it has AmazonS3FullAccess permission.
+
+
+
+We need to prep the python code, see the Notes in the pyspark_job.py file for the changes.
+1. val kafkaReaderConfig = KafkaReaderConfig("*BootstrapConnectString*", "dbserver1.demo.bus_status")
+2. val schemas  = get_schema("s3://'<your-s3-bucket>'/bus_status.json")
+- From the vm, copy the file over
+  - `aws s3 cp bus_status_schema.json s3://bus-service-wcd-eu-west-1/msk/bus_status_schema.json`
+3. new StreamingJobExecutor(spark, kafkaReaderConfig, "s3://'<your-s3-bucket>'/checkpoint/job", schemas).execute()
+4. .save("s3://'<your-s3-bucket>'/hudi/bus_status_bootcamp3")
+
+5. copy the python file over to s3 bucket: s3://'<your-s3-bucket>'/jars/pyspark_job.py
+`AWS_PROFILE=indrani aws s3 cp EMR-setup/pyspark_job.py s3://bus-service-wcd-eu-west-1/msk/jars/pyspark_job.py `
+
+```bash
+# SSH into the emr-master
+
+# Make sure that you add ssh access for your IP to the security group associated with ElasticMapReduce-master
+# To find this easily, you can look in the Summary tab of your EMR, then in the Security and Access, you can find the link to the security group associated with ElasticMapReduce-master
+ssh -i 01-setup-ec-vm/nifi-ec-vm.pem hadoop@ec2-3-99-238-134.ca-central-1.compute.amazonaws.com
+
+#  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.1
+# --packages org.apache.spark:spark-sql-kafka-0-10_2.13:3.3.1
+
+pyspark --jars /usr/lib/hudi/hudi-spark-bundle.jar,/usr/lib/spark/external/lib/spark-avro.jar --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.1 --conf "spark.serializer=org.apache.spark.serializer.KryoSerializer" --conf "spark.sql.hive.convertMetastoreParquet=false" --conf 'spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem'
+
+spark-submit --master yarn --deploy-mode client --name wcd-streaming-app --jars /usr/lib/hudi/hudi-spark-bundle.jar,/usr/lib/spark/external/lib/spark-avro.jar --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.1 --conf "spark.serializer=org.apache.spark.serializer.KryoSerializer" --conf "spark.sql.hive.convertMetastoreParquet=false" s3://bus-service-wcd-eu-west-1/msk/jars/pyspark_job.py
+
+spark-submit --master yarn --deploy-mode cluster --name wcd-stremaing-app --jars /usr/lib/hudi/hudi-spark-bundle.jar,/usr/lib/spark/external/lib/spark-avro.jar --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.1 --conf "spark.serializer=org.apache.spark.serializer.KryoSerializer" --conf "spark.sql.hive.convertMetastoreParquet=false" s3://bus-service-wcd-eu-west-1/msk/jars/pyspark_job.py
+
+```
+
 
 ## Verify links
 
@@ -431,82 +505,5 @@ transform_df.writeStream.format("iceberg").outputMode("append") \
     .option("path", 's3_path') # issue is here somewhere \
     .option("checkpointLocation", checkpoint_location) \
     .start()
-
-```
-
-
-# MSK
-
-Client Information -> Plaintext Private Endpoint
-Install telnet in virtual machine
-
-```bash
-sudo yum install telnet -y 
-telnet b-1.finalproject.m5cy8k.c3.kafka.ca-central-1.amazonaws.com:9092
-
-```
-
-```bash
-# Be sure to only stop the docker containers if you want to start them again in the future
-# docker stop kafka zookeeper connect spark-master spark-worker
-# WARNING: running docker rm will remove the data and you will have to redo several steps
-
-# Set up client.properties as per the guide in kafka_2.12-2.6.2/bin
-
-# Set up environment variables for your connection strings
-ZOOKEEPER_CONNECTION_STRING=z-3.finalproject.m5cy8k.c3.kafka.ca-central-1.amazonaws.com:2181,z-2.finalproject.m5cy8k.c3.kafka.ca-central-1.amazonaws.com:2181,z-1.finalproject.m5cy8k.c3.kafka.ca-central-1.amazonaws.com:2181
-BOOTSTRAP_SERVERS=b-1.finalproject.m5cy8k.c3.kafka.ca-central-1.amazonaws.com:9092,b-3.finalproject.m5cy8k.c3.kafka.ca-central-1.amazonaws.com:9092,b-2.finalproject.m5cy8k.c3.kafka.ca-central-1.amazonaws.com:9092
-
-# Check that you are able to retrieve the topics on MSK
-./kafka-topics.sh --list --zookeeper $ZOOKEEPER_CONNECTION_STRING
-
-# Start the connect-msk docker so that the nifi and mysql containers are connected and ready to talk to MSK
-docker run -dit --name connect-msk -p 8083:8083 -e GROUP_ID=1 -e CONFIG_STORAGE_TOPIC=my-connect-configs -e OFFSET_STORAGE_TOPIC=my-connect-offsets -e STATUS_STORAGE_TOPIC=my_connect_statuses -e BOOTSTRAP_SERVERS=$BOOTSTRAP_SERVERS -e KAFKA_VERSION=2.6.2 -e CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR=2 -e CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR=2 -e CONNECT_STATUS_STORAGE_REPLICATION_FACTOR=2 --link mysql:mysql debezium/connect:1.8.0.Final
-
-# Read the messages in the connection topic: my-connect-configs
-./kafka-console-consumer.sh  --bootstrap-server $BOOTSTRAP_SERVERS --topic my-connect-configs --from-beginning
-
-# Create a connector so that nifi mysql are sending messages to kafka in MSK
-curl -i -X POST -H "Accept:application/json" -H "Content-Type:application/json" localhost:8083/connectors/ -d '{ "name": "bus-connector", "config": { "connector.class": "io.debezium.connector.mysql.MySqlConnector", "tasks.max": "1", "database.hostname": "mysql", "database.port": "3306", "database.user": "root", "database.password": "debezium", "database.server.id": "184054", "database.server.name": "dbserver1", "database.include.list": "demo", "database.history.kafka.bootstrap.servers": "'"$BOOTSTRAP_SERVERS"'", "database.history.kafka.topic": "dbhistory.demo" } }'
-
- ./kafka-topics.sh --list --zookeeper $ZOOKEEPER_CONNECTION_STRING
-
-# read incoming messages on dbserver1.demo.bus_status
-./kafka-console-consumer.sh  --bootstrap-server $BOOTSTRAP_SERVERS  --topic dbserver1.demo.bus_status  --from-beginning
-
-```
-
-Let's set up the EMR Cluster: https://ca-central-1.console.aws.amazon.com/elasticmapreduce/home?region=ca-central-1#
-Use screenshots - For the initial setup.
-Once we are setup, navigate the EMR IAM Role. eg: EMR_EC2_DefaultRole and make sure it has AmazonS3FullAccess permission.
-
-
-
-We need to prep the python code, see the Notes in the pyspark_job.py file for the changes.
-1. val kafkaReaderConfig = KafkaReaderConfig("*BootstrapConnectString*", "dbserver1.demo.bus_status")
-2. val schemas  = get_schema("s3://'<your-s3-bucket>'/bus_status.json")
-- From the vm, copy the file over
-  - `aws s3 cp bus_status_schema.json s3://bus-service-wcd-eu-west-1/msk/bus_status_schema.json`
-3. new StreamingJobExecutor(spark, kafkaReaderConfig, "s3://'<your-s3-bucket>'/checkpoint/job", schemas).execute()
-4. .save("s3://'<your-s3-bucket>'/hudi/bus_status_bootcamp3")
-
-5. copy the python file over to s3 bucket: s3://'<your-s3-bucket>'/jars/pyspark_job.py
-`AWS_PROFILE=indrani aws s3 cp EMR-setup/pyspark_job.py s3://bus-service-wcd-eu-west-1/msk/jars/pyspark_job.py `
-
-```bash
-# SSH into the emr-master
-
-# Make sure that you add ssh access for your IP to the security group associated with ElasticMapReduce-master
-# To find this easily, you can look in the Summary tab of your EMR, then in the Security and Access, you can find the link to the security group associated with ElasticMapReduce-master
-ssh -i 01-setup-ec-vm/nifi-ec-vm.pem hadoop@ec2-3-99-238-134.ca-central-1.compute.amazonaws.com
-
-#  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.1
-# --packages org.apache.spark:spark-sql-kafka-0-10_2.13:3.3.1
-
-pyspark --jars /usr/lib/hudi/hudi-spark-bundle.jar,/usr/lib/spark/external/lib/spark-avro.jar --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.1 --conf "spark.serializer=org.apache.spark.serializer.KryoSerializer" --conf "spark.sql.hive.convertMetastoreParquet=false" --conf 'spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem'
-
-spark-submit --master yarn --deploy-mode client --name wcd-streaming-app --jars /usr/lib/hudi/hudi-spark-bundle.jar,/usr/lib/spark/external/lib/spark-avro.jar --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.1 --conf "spark.serializer=org.apache.spark.serializer.KryoSerializer" --conf "spark.sql.hive.convertMetastoreParquet=false" s3://bus-service-wcd-eu-west-1/msk/jars/pyspark_job.py
-
-spark-submit --master yarn --deploy-mode cluster --name wcd-stremaing-app --jars /usr/lib/hudi/hudi-spark-bundle.jar,/usr/lib/spark/external/lib/spark-avro.jar --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.1 --conf "spark.serializer=org.apache.spark.serializer.KryoSerializer" --conf "spark.sql.hive.convertMetastoreParquet=false" s3://bus-service-wcd-eu-west-1/msk/jars/pyspark_job.py
 
 ```
