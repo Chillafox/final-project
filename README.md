@@ -8,8 +8,8 @@ Main file used for Toronto Bus System Streaming Data pipline project
 Zekun Peng
 3/5/2023
 ##########
-![alt text](https://github.com/Chillafox/final-project/final-project-0.png?raw=true)
 ![Screenshot](final-project-0.png)
+
 # 01-setup-ec-vm
 
 Network: vpc-3f2f7b57
